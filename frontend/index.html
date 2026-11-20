@@ -53,6 +53,7 @@ createApp({
     const username=ref('admin'), password=ref('123456'), err=ref(''), actionErr=ref('');
     const leftTab=ref(0), rightTab=ref(0);
     const versions=ref([]), mappings=ref([]), formal=ref([]), conflicts=ref([]);
+    const audits=ref([]), generations=ref([]), crosscheck=ref(null);
     const oldKey=ref('OLD-B1');
     function auth(){return {Authorization:'Bearer '+token.value,'Content-Type':'application/json'};}
     async function login(){
@@ -80,6 +81,12 @@ createApp({
       formal.value=Array.isArray(f.items)?f.items:[];
       const c=await loadJson('/api/conflicts'); if(c===null) return;
       conflicts.value=Array.isArray(c.items)?c.items:[];
+      const a=await loadJson('/api/replay-audits'); if(a===null) return;
+      audits.value=Array.isArray(a.items)?a.items:[];
+      const g=await loadJson('/api/generations'); if(g===null) return;
+      generations.value=Array.isArray(g.items)?g.items:[];
+      const x=await loadJson('/api/crosscheck'); if(x===null) return;
+      crosscheck.value=x;
     }
     async function doRemap(){
       actionErr.value='';
@@ -87,8 +94,22 @@ createApp({
       const j=await r.json(); actionErr.value=r.ok?('正式键 '+j.entity_key):(j.detail||'失败');
       await refresh();
     }
+    async function doReplay(id){
+      actionErr.value='';
+      const r=await fetch('/api/conflicts/'+id+'/replay',{method:'POST',headers:auth()});
+      const j=await r.json().catch(()=>({}));
+      if(r.ok){
+        const label={skip:'甲路径·幂等跳过（正式零改）',overwrite:'乙路径·带审计覆盖（generation 抬升）',
+                     insert:'乙路径·新入正式区（generation=1）',deviation:'偏离拒写（记 replay_deviation）'}[j.path]||j.path;
+        actionErr.value='重放#'+id+' → '+label;
+      }else{
+        actionErr.value='重放#'+id+' → '+(j.detail||'失败')+(j.detail==='replay_contention'?'（后到者只记争用，正式零改）':'');
+      }
+      await refresh();
+    }
     onMounted(()=>{if(token.value)refresh();});
-    return {token,user,username,password,err,actionErr,leftTab,rightTab,versions,mappings,formal,conflicts,oldKey,login,logout,doRemap};
+    return {token,user,username,password,err,actionErr,leftTab,rightTab,versions,mappings,formal,conflicts,
+            audits,generations,crosscheck,oldKey,login,logout,doRemap,doReplay};
   },
   template:`
   <div v-if="!token" class="login">
@@ -128,17 +149,52 @@ createApp({
       <div class="pane">
         <div class="tabs">
           <button :class="{on:rightTab===0}" @click="rightTab=0">正式区</button>
-          <button :class="{on:rightTab===1}" @click="rightTab=1">冲突队列</button>
+          <button :class="{on:rightTab===1}" @click="rightTab=1">冲突队列/重放</button>
+          <button :class="{on:rightTab===2}" @click="rightTab=2">世代列表</button>
+          <button :class="{on:rightTab===3}" @click="rightTab=3">重放审计</button>
+          <button :class="{on:rightTab===4}" @click="rightTab=4">互证页</button>
         </div>
         <div class="box" v-show="rightTab===0">
-          <h2>Formal Zone</h2>
-          <table><thead><tr><th>entity</th><th>from</th><th>ver</th><th>at</th></tr></thead>
-          <tbody><tr v-for="f in formal" :key="f.id"><td class="ok">{{f.entity_key}}</td><td>{{f.mapped_from}}</td><td>{{f.version}}</td><td>{{f.created_at}}</td></tr></tbody></table>
+          <h2>Formal Zone（正式实体 · 当前世代）</h2>
+          <table><thead><tr><th>entity</th><th>from</th><th>ver</th><th>gen</th><th>at</th></tr></thead>
+          <tbody><tr v-for="f in formal" :key="f.id"><td class="ok">{{f.entity_key}}</td><td>{{f.mapped_from}}</td><td>{{f.version}}</td><td><span class="pill">G{{f.generation}}</span></td><td>{{f.created_at}}</td></tr></tbody></table>
         </div>
         <div class="box" v-show="rightTab===1">
-          <h2>Conflicts</h2>
-          <table><thead><tr><th>old</th><th>reason</th><th>status</th></tr></thead>
-          <tbody><tr v-for="c in conflicts" :key="c.id"><td class="bad">{{c.old_key}}</td><td>{{c.reason}}</td><td>{{c.status}}</td></tr></tbody></table>
+          <h2>Conflicts（冲突区 · 重放走此入口，不另起重放台）</h2>
+          <table><thead><tr><th>old</th><th>reason</th><th>status</th><th>重放</th></tr></thead>
+          <tbody><tr v-for="cf in conflicts" :key="cf.id">
+            <td class="bad">{{cf.old_key}}</td><td>{{cf.reason}}</td>
+            <td :class="cf.status==='已重放'?'ok':'bad'">{{cf.status}}<span v-if="cf.replay_id" class="pill">审计#{{cf.replay_id}}</span></td>
+            <td><button class="ghost" :disabled="cf.status==='已重放'" @click="doReplay(cf.id)">{{cf.status==='已重放'?'已重放':'重放'}}</button></td>
+          </tr></tbody></table>
+        </div>
+        <div class="box" v-show="rightTab===2">
+          <h2>Entity Generations（被盖快照 · 世代可溯）</h2>
+          <table><thead><tr><th>entity</th><th>from</th><th>ver</th><th>gen</th><th>superseded_at</th></tr></thead>
+          <tbody><tr v-for="g in generations" :key="g.id"><td>{{g.entity_key}}</td><td>{{g.mapped_from}}</td><td>{{g.version}}</td><td><span class="pill">G{{g.generation}}</span></td><td>{{g.superseded_at}}</td></tr></tbody></table>
+          <p v-if="!generations.length" style="color:var(--muted);font-size:12px">尚无被盖快照（覆盖发生时才落快照）。</p>
+        </div>
+        <div class="box" v-show="rightTab===3">
+          <h2>Replay Audits（skip / apply / contention / deviation）</h2>
+          <table><thead><tr><th>#</th><th>conflict</th><th>event</th><th>entity</th><th>gen 前→后</th><th>快照</th><th>at</th></tr></thead>
+          <tbody><tr v-for="a in audits" :key="a.id">
+            <td>{{a.id}}</td><td>#{{a.conflict_id}}</td>
+            <td :class="a.event==='replay_apply'?'ok':(a.event==='replay_contention'?'bad':'')">{{a.event}}</td>
+            <td>{{a.entity_key||'—'}}</td><td>{{a.generation_before??'—'}}→{{a.generation_after??'—'}}</td><td>{{a.snapshot_id||'—'}}</td><td>{{a.created_at}}</td>
+          </tr></tbody></table>
+        </div>
+        <div class="box" v-show="rightTab===4">
+          <h2>Crosscheck（正式 × 世代链 × 审计 × 冲突，同态互证）</h2>
+          <p :class="crosscheck&&crosscheck.ok?'ok':'bad'">
+            总账：{{crosscheck&&crosscheck.ok?'一致，无断链':'存在 mismatch / 孤儿冲突'}}
+            <span v-if="crosscheck&&crosscheck.orphan_conflict_ids.length" class="pill">孤儿冲突 {{crosscheck.orphan_conflict_ids.join(',')}}</span>
+          </p>
+          <table><thead><tr><th>entity</th><th>正式 G</th><th>链最大 G</th><th>快照数</th><th>apply 审计</th><th>关联冲突</th><th>判定</th></tr></thead>
+          <tbody><tr v-for="x in (crosscheck?crosscheck.items:[])" :key="x.entity_key">
+            <td>{{x.entity_key}}</td><td><span class="pill">G{{x.formal_generation}}</span></td><td>G{{x.chain_max_generation}}</td>
+            <td>{{x.snapshot_count}}</td><td>{{x.apply_audit_count}}</td><td>{{x.linked_conflict_ids.map(i=>'#'+i).join(' ')||'—'}}</td>
+            <td :class="x.status==='ok'?'ok':'bad'">{{x.status==='ok'?'ok':'mismatch'}}<div v-for="m in x.mismatches" :key="m" style="font-size:11px">{{m}}</div></td>
+          </tr></tbody></table>
         </div>
       </div>
     </div>
